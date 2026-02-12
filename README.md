@@ -24,9 +24,65 @@ cp .env.example .env
 uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
 ```
 
-打开：
+打开浏览器：
 
 - [http://127.0.0.1:8080](http://127.0.0.1:8080)
+- 说明：应用会自动读取项目根目录 `.env`，无需再手动 `export` 或 `setx`
+
+### Windows 启动（PowerShell）
+
+```powershell
+cd $HOME\Desktop
+git clone https://github.com/jonhncatt/langchain_agent.git
+cd .\langchain_agent
+
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
+# 编辑 .env（至少填 OPENAI_API_KEY；需要的话再填网关和 CA）
+
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+```
+
+### Windows 启动（CMD）
+
+```bat
+cd %USERPROFILE%\Desktop
+git clone https://github.com/jonhncatt/langchain_agent.git
+cd langchain_agent
+
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+copy .env.example .env
+rem 编辑 .env（至少填 OPENAI_API_KEY；需要的话再填网关和 CA）
+
+.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+```
+
+### Windows 日常启动（后续每次）
+
+首次配置完成后，后续每次只需要：
+
+```powershell
+cd $HOME\Desktop\langchain_agent
+git pull
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
+```
+
+检查 `OFFICETOOL_EXTRA_ALLOWED_ROOTS` 是否生效：
+
+```powershell
+cd $HOME\Desktop\langchain_agent
+.\.venv\Scripts\python.exe -c "from app.config import load_config; c=load_config(); print(c.allowed_roots)"
+```
+
+如果助手仍说“只能看当前目录”，先确认：
+
+- 左侧 `启用本地工具执行` 已勾选
+- 提问时带绝对路径（示例：`请列出 C:/Users/<YOU>/Desktop/workbench`）
+- 看“执行轨迹”是否出现 `执行工具: list_directory` / `read_text_file`
 
 ## 主要能力
 
@@ -101,4 +157,3 @@ app/
 - `OFFICETOOL_ALLOWED_COMMANDS`
 - `OFFICETOOL_EXTRA_ALLOWED_ROOTS`
 - `OFFICETOOL_ALLOW_ANY_PATH`
-
