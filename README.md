@@ -118,6 +118,13 @@ cd $HOME\Desktop\langchain_agent
 
 说明：当前 LangChain Agent 流程里，文档会抽取文本注入；图片会以元数据提示注入（不是像素级视觉解析）。
 
+## 页面参数（左侧）
+
+- `通用模式 / 编码模式`：一键切换模型与参数预设（编码模式默认 `gpt-5.1-codex-mini`）。
+- `最大输出 tokens`：单次回复 token 上限，默认 `32000`。
+- `上下文消息条数`：每次请求带入的历史消息数量，默认 `100`。
+- `回答长度`：输出风格（短/中/长），不是固定 token 数。
+
 ## 目录结构
 
 ```text
@@ -154,6 +161,12 @@ app/
 - `OPENAI_API_KEY`
 - `OFFICETOOL_OPENAI_BASE_URL`
 - `OFFICETOOL_DEFAULT_MODEL`
+- `OFFICETOOL_SUMMARY_MODEL` / `OFFICETOOL_SUMMARY_MODE`
+- `OFFICETOOL_TEMPERATURE`
 - `OFFICETOOL_ALLOWED_COMMANDS`
 - `OFFICETOOL_EXTRA_ALLOWED_ROOTS`
 - `OFFICETOOL_ALLOW_ANY_PATH`
+
+## 注意事项
+
+- 如页面按钮点击无反应，先强制刷新浏览器缓存（Windows: `Ctrl+F5`）。服务端已对 `/static/*` 设置 `no-cache`。
