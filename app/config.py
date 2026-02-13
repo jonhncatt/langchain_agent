@@ -154,7 +154,9 @@ def load_config() -> AppConfig:
     openai_ca_cert_path = (
         _env("OFFICETOOL_CA_CERT_PATH", "OFFCIATOOL_CA_CERT_PATH", "SSL_CERT_FILE", default="") or ""
     ).strip() or None
-    openai_temperature_raw = (_env("OFFICETOOL_TEMPERATURE", "OFFCIATOOL_TEMPERATURE", default="") or "").strip()
+    openai_temperature_raw = (
+        _env("OFFICETOOL_TEMPERATURE", "OFFCIATOOL_TEMPERATURE", default="") or ""
+    ).strip()
     openai_temperature: float | None = None
     if openai_temperature_raw:
         try:
@@ -189,7 +191,7 @@ def load_config() -> AppConfig:
         (_env("OFFICETOOL_WEB_FETCH_TIMEOUT_SEC", "OFFCIATOOL_WEB_FETCH_TIMEOUT_SEC", default="12") or "12").strip()
     )
     web_fetch_max_chars = int(
-        (_env("OFFICETOOL_WEB_FETCH_MAX_CHARS", "OFFCIATOOL_WEB_FETCH_MAX_CHARS", default="24000") or "24000").strip()
+        (_env("OFFICETOOL_WEB_FETCH_MAX_CHARS", "OFFCIATOOL_WEB_FETCH_MAX_CHARS", default="120000") or "120000").strip()
     )
     web_skip_tls_verify_raw = (
         _env("OFFICETOOL_WEB_SKIP_TLS_VERIFY", "OFFCIATOOL_WEB_SKIP_TLS_VERIFY", default="false") or "false"
@@ -223,15 +225,16 @@ def load_config() -> AppConfig:
         web_allowed_domains=web_allowed_domains,
         web_allow_all_domains=web_allow_all_domains,
         web_fetch_timeout_sec=max(3, min(30, web_fetch_timeout_sec)),
-        web_fetch_max_chars=max(2000, min(120000, web_fetch_max_chars)),
+        web_fetch_max_chars=max(2000, min(500000, web_fetch_max_chars)),
         web_skip_tls_verify=web_skip_tls_verify,
         web_ca_cert_path=web_ca_cert_path,
         openai_base_url=openai_base_url,
         openai_ca_cert_path=openai_ca_cert_path,
         openai_temperature=openai_temperature,
         openai_use_responses_api=openai_use_responses_api,
-        default_model=_env("OFFICETOOL_DEFAULT_MODEL", "OFFCIATOOL_DEFAULT_MODEL", default="gpt-5.1-chat")
-        or "gpt-5.1-chat",
+        default_model=(
+            _env("OFFICETOOL_DEFAULT_MODEL", "OFFCIATOOL_DEFAULT_MODEL", default="gpt-5.1-chat") or "gpt-5.1-chat"
+        ),
         summary_model=(
             _env(
                 "OFFICETOOL_SUMMARY_MODEL",
@@ -244,15 +247,36 @@ def load_config() -> AppConfig:
         ),
         system_prompt=_env("OFFICETOOL_SYSTEM_PROMPT", "OFFCIATOOL_SYSTEM_PROMPT", default=DEFAULT_SYSTEM_PROMPT)
         or DEFAULT_SYSTEM_PROMPT,
-        summary_trigger_turns=int(
-            _env("OFFICETOOL_SUMMARY_TRIGGER_TURNS", "OFFCIATOOL_SUMMARY_TRIGGER_TURNS", default="24") or "24"
+        summary_trigger_turns=max(
+            6,
+            min(
+                10000,
+                int(
+                    _env("OFFICETOOL_SUMMARY_TRIGGER_TURNS", "OFFCIATOOL_SUMMARY_TRIGGER_TURNS", default="2000")
+                    or "2000"
+                ),
+            ),
         ),
-        max_context_turns=int(
-            _env("OFFICETOOL_MAX_CONTEXT_TURNS", "OFFCIATOOL_MAX_CONTEXT_TURNS", default="100") or "100"
+        max_context_turns=max(
+            2,
+            min(
+                2000,
+                int(_env("OFFICETOOL_MAX_CONTEXT_TURNS", "OFFCIATOOL_MAX_CONTEXT_TURNS", default="2000") or "2000"),
+            ),
         ),
-        max_attachment_chars=int(
-            _env("OFFICETOOL_MAX_ATTACHMENT_CHARS", "OFFCIATOOL_MAX_ATTACHMENT_CHARS", default="24000") or "24000"
+        max_attachment_chars=max(
+            2000,
+            min(
+                1000000,
+                int(
+                    _env("OFFICETOOL_MAX_ATTACHMENT_CHARS", "OFFCIATOOL_MAX_ATTACHMENT_CHARS", default="1000000")
+                    or "1000000"
+                ),
+            ),
         ),
-        max_upload_mb=int(_env("OFFICETOOL_MAX_UPLOAD_MB", "OFFCIATOOL_MAX_UPLOAD_MB", default="20") or "20"),
+        max_upload_mb=max(
+            1,
+            min(2048, int(_env("OFFICETOOL_MAX_UPLOAD_MB", "OFFCIATOOL_MAX_UPLOAD_MB", default="200") or "200")),
+        ),
         allowed_commands=_split_csv(allowed_commands_raw),
     )

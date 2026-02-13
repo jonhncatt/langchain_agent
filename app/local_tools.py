@@ -9,6 +9,7 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from html import unescape
 from pathlib import Path
 from typing import Any
@@ -156,6 +157,247 @@ def _looks_like_script_payload(text: str) -> bool:
     return (hits >= 3 and longest_line >= 220) or punct_ratio >= 0.45
 
 
+def _extract_search_query(url: str) -> str | None:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except Exception:
+        return None
+
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return None
+
+    q = urllib.parse.parse_qs(parsed.query or "")
+    key = None
+    if "google." in host or "bing." in host:
+        key = "q"
+    elif "yahoo." in host:
+        key = "p"
+    elif "baidu." in host:
+        key = "wd"
+
+    if not key:
+        return None
+    vals = q.get(key) or []
+    if not vals:
+        return None
+    out = (vals[0] or "").strip()
+    return out or None
+
+
+def _clean_html_fragment(raw_html: str) -> str:
+    text = re.sub(r"(?s)<[^>]+>", " ", raw_html or "")
+    text = unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _decode_ddg_redirect(raw_url: str) -> str:
+    if not raw_url:
+        return raw_url
+    url = unescape(raw_url).strip()
+    absolute = urllib.parse.urljoin("https://duckduckgo.com", url)
+    try:
+        parsed = urllib.parse.urlsplit(absolute)
+    except Exception:
+        return absolute
+
+    host = (parsed.hostname or "").lower()
+    if host.endswith("duckduckgo.com") and parsed.path == "/l/":
+        q = urllib.parse.parse_qs(parsed.query or "")
+        target = (q.get("uddg") or [""])[0].strip()
+        if target:
+            return urllib.parse.unquote(target)
+    return absolute
+
+
+def _extract_ddg_results(raw_html: str, max_results: int) -> list[dict[str, str]]:
+    html = raw_html or ""
+    limit = max(1, min(20, int(max_results)))
+    patterns = [
+        re.compile(
+            r'(?is)<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>'
+        ),
+        re.compile(
+            r"(?is)<a[^>]*class=['\"][^'\"]*result-link[^'\"]*['\"][^>]*href=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>"
+        ),
+    ]
+
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+
+    for pattern in patterns:
+        for match in pattern.finditer(html):
+            href = _decode_ddg_redirect(match.group(1) or "")
+            title = _clean_html_fragment(match.group(2) or "")
+            if not href or not title:
+                continue
+            try:
+                parsed = urllib.parse.urlsplit(href)
+            except Exception:
+                continue
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            host = (parsed.hostname or "").lower()
+            if host.endswith("duckduckgo.com") and parsed.path == "/y.js":
+                continue
+
+            key = f"{href}|{title}".lower()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            snippet = ""
+            window = html[match.end() : match.end() + 2400]
+            snippet_match = re.search(
+                r'(?is)<(?:a|div|span)[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div|span)>',
+                window,
+            )
+            if not snippet_match:
+                snippet_match = re.search(
+                    r"(?is)<td[^>]*class=['\"][^'\"]*result-snippet[^'\"]*['\"][^>]*>(.*?)</td>",
+                    window,
+                )
+            if snippet_match:
+                snippet = _clean_html_fragment(snippet_match.group(1) or "")
+
+            out.append({"title": title, "url": href, "snippet": snippet})
+            if len(out) >= limit:
+                return out
+
+    return out
+
+
+def _looks_news_like_query(query: str) -> bool:
+    text = (query or "").strip().lower()
+    if not text:
+        return False
+    keywords = [
+        "news",
+        "latest",
+        "breaking",
+        "headline",
+        "headlines",
+        "today",
+        "score",
+        "scores",
+        "新闻",
+        "消息",
+        "今日",
+        "今天",
+        "速报",
+        "戰報",
+        "战报",
+        "比分",
+        "ニュース",
+    ]
+    return any(k in text for k in keywords)
+
+
+def _looks_baseball_query(query: str) -> bool:
+    text = (query or "").strip().lower()
+    if not text:
+        return False
+    keywords = [
+        "baseball",
+        "mlb",
+        "npb",
+        "kbo",
+        "棒球",
+        "野球",
+        "甲子園",
+        "甲子园",
+        "大谷",
+    ]
+    return any(k in text for k in keywords)
+
+
+def _build_rss_candidates(query: str) -> list[tuple[str, str]]:
+    q = (query or "").strip()
+    out: list[tuple[str, str]] = []
+    is_baseball = _looks_baseball_query(q)
+
+    if is_baseball:
+        q_en = urllib.parse.quote_plus(f"{q} baseball")
+        q_ja = urllib.parse.quote_plus(f"{q} 野球")
+        out.extend(
+            [
+                ("mlb_official_rss", "https://www.mlb.com/feeds/news/rss.xml"),
+                ("espn_mlb_rss", "https://www.espn.com/espn/rss/mlb/news"),
+                ("yahoo_mlb_rss", "https://sports.yahoo.com/mlb/rss/"),
+                (
+                    "google_news_baseball_en",
+                    f"https://news.google.com/rss/search?q={q_en}&hl=en-US&gl=US&ceid=US:en",
+                ),
+                (
+                    "google_news_baseball_ja",
+                    f"https://news.google.com/rss/search?q={q_ja}&hl=ja&gl=JP&ceid=JP:ja",
+                ),
+                ("nhk_sports_rss", "https://www3.nhk.or.jp/rss/news/cat7.xml"),
+            ]
+        )
+    else:
+        quoted = urllib.parse.quote_plus(q)
+        out.append(
+            (
+                "google_news_query_zh",
+                f"https://news.google.com/rss/search?q={quoted}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+            )
+        )
+        out.append(
+            (
+                "google_news_query_en",
+                f"https://news.google.com/rss/search?q={quoted}&hl=en-US&gl=US&ceid=US:en",
+            )
+        )
+
+    seen: set[str] = set()
+    deduped: list[tuple[str, str]] = []
+    for name, url in out:
+        if url in seen:
+            continue
+        seen.add(url)
+        deduped.append((name, url))
+    return deduped
+
+
+def _extract_google_news_rss_results(raw_xml: str, max_results: int) -> list[dict[str, str]]:
+    limit = max(1, min(20, int(max_results)))
+    xml_text = (raw_xml or "").strip()
+    if not xml_text:
+        return []
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return []
+
+    items = root.findall(".//item")
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        desc = (item.findtext("description") or "").strip()
+        if not title or not link:
+            continue
+
+        title = _clean_html_fragment(title)
+        link = _clean_html_fragment(link)
+        snippet = _clean_html_fragment(desc)
+        key = f"{title}|{link}".lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        published_at = (item.findtext("pubDate") or "").strip()
+        entry = {"title": title, "url": link, "snippet": snippet}
+        if published_at:
+            entry["published_at"] = published_at
+        out.append(entry)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _normalize_url_for_request(raw_url: str) -> str:
     """
     Make URL safe for urllib by encoding non-ASCII host/path/query.
@@ -233,12 +475,13 @@ class LocalToolExecutor:
             {
                 "type": "function",
                 "name": "read_text_file",
-                "description": "Read a UTF-8 text file in workspace.",
+                "description": "Read a UTF-8 text file in workspace. Supports chunked reads with start_char.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string"},
-                        "max_chars": {"type": "integer", "minimum": 128, "maximum": 50000, "default": 10000},
+                        "start_char": {"type": "integer", "minimum": 0, "default": 0},
+                        "max_chars": {"type": "integer", "minimum": 128, "maximum": 1000000, "default": 200000},
                     },
                     "required": ["path"],
                     "additionalProperties": False,
@@ -301,10 +544,25 @@ class LocalToolExecutor:
                     "type": "object",
                     "properties": {
                         "url": {"type": "string", "description": "http/https URL"},
-                        "max_chars": {"type": "integer", "minimum": 512, "maximum": 120000, "default": 24000},
+                        "max_chars": {"type": "integer", "minimum": 512, "maximum": 500000, "default": 120000},
                         "timeout_sec": {"type": "integer", "minimum": 3, "maximum": 30, "default": 12},
                     },
                     "required": ["url"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": "search_web",
+                "description": "Search the web by query and return candidate URLs/snippets.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query keywords"},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+                        "timeout_sec": {"type": "integer", "minimum": 3, "maximum": 30, "default": 12},
+                    },
+                    "required": ["query"],
                     "additionalProperties": False,
                 },
             },
@@ -325,6 +583,8 @@ class LocalToolExecutor:
             return self.replace_in_file(**arguments)
         if name == "fetch_web":
             return self.fetch_web(**arguments)
+        if name == "search_web":
+            return self.search_web(**arguments)
         return {"ok": False, "error": f"Unknown tool: {name}"}
 
     def run_shell(self, command: str, cwd: str = ".", timeout_sec: int = 15) -> dict[str, Any]:
@@ -399,7 +659,7 @@ class LocalToolExecutor:
         except Exception as exc:
             return {"ok": False, "error": f"list_directory failed: {exc}"}
 
-    def read_text_file(self, path: str, max_chars: int = 10000) -> dict[str, Any]:
+    def read_text_file(self, path: str, start_char: int = 0, max_chars: int = 200000) -> dict[str, Any]:
         try:
             real_path = _resolve_workspace_path(self.config, path)
             if not real_path.exists():
@@ -409,15 +669,23 @@ class LocalToolExecutor:
 
             full_text = real_path.read_text(encoding="utf-8", errors="ignore")
             total_length = len(full_text)
-            text = full_text[:max_chars]
-            truncated = total_length > len(text)
+            limit = max(128, min(1_000_000, int(max_chars)))
+            start = max(0, int(start_char))
+            if start > total_length:
+                start = total_length
+            end = min(total_length, start + limit)
+            text = full_text[start:end]
+            truncated = end < total_length
             return {
                 "ok": True,
                 "path": str(real_path),
                 "content": text,
                 "length": len(text),
+                "start_char": start,
+                "end_char": end,
                 "total_length": total_length,
                 "truncated": truncated,
+                "has_more": truncated,
             }
         except Exception as exc:
             return {"ok": False, "error": f"read_text_file failed: {exc}"}
@@ -536,7 +804,238 @@ class LocalToolExecutor:
                 return True
         return False
 
-    def fetch_web(self, url: str, max_chars: int = 24000, timeout_sec: int = 12) -> dict[str, Any]:
+    def search_web(self, query: str, max_results: int = 5, timeout_sec: int = 12) -> dict[str, Any]:
+        q = (query or "").strip()
+        if not q:
+            return {"ok": False, "error": "query cannot be empty"}
+
+        timeout_val = max(3, min(30, timeout_sec))
+        limit = max(1, min(20, int(max_results)))
+        read_limit = min(500000, max(20000, self.config.web_fetch_max_chars))
+        ddg_allowed = self._domain_allowed("duckduckgo.com")
+        prefer_news = _looks_news_like_query(q)
+        prefer_baseball = _looks_baseball_query(q)
+        rss_candidates = _build_rss_candidates(q)
+        rss_allowed_candidates: list[tuple[str, str]] = []
+        for name, url in rss_candidates:
+            host = (urllib.parse.urlsplit(url).hostname or "").strip().lower()
+            if host and self._domain_allowed(host):
+                rss_allowed_candidates.append((name, url))
+
+        if not ddg_allowed and not rss_allowed_candidates:
+            return {
+                "ok": False,
+                "error": (
+                    "Domain not allowed for search engines and RSS sources. "
+                    f"Allowed: {', '.join(self.config.web_allowed_domains)}"
+                ),
+            }
+
+        search_url = "https://duckduckgo.com/html/?q=" + urllib.parse.quote_plus(q)
+        lite_url = "https://lite.duckduckgo.com/lite/?q=" + urllib.parse.quote_plus(q)
+
+        if self.config.web_skip_tls_verify:
+            ssl_context = ssl._create_unverified_context()
+        elif self.config.web_ca_cert_path:
+            try:
+                ssl_context = ssl.create_default_context(cafile=self.config.web_ca_cert_path)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": f"Invalid web CA cert path: {self.config.web_ca_cert_path} ({exc})",
+                }
+        else:
+            ssl_context = ssl.create_default_context()
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.5",
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+
+        tls_warning: str | None = None
+        active_context = ssl_context
+
+        def _open(current_context: ssl.SSLContext | None, target_url: str):
+            req = urllib.request.Request(
+                url=target_url,
+                headers=headers,
+                method="GET",
+            )
+            opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=current_context))
+            return opener.open(req, timeout=timeout_val)
+
+        def _fetch_page(target_url: str, current_context: ssl.SSLContext | None) -> tuple[int, str, str, bool]:
+            with _open(current_context, target_url) as resp:
+                status = getattr(resp, "status", None) or 200
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                raw = resp.read(read_limit + 1)
+                truncated = len(raw) > read_limit
+                raw = raw[:read_limit]
+                text = raw.decode("utf-8", errors="ignore")
+                return status, content_type, text, truncated
+
+        def _fetch_page_with_retry(target_url: str) -> tuple[int, str, str, bool]:
+            nonlocal active_context, tls_warning
+            try:
+                return _fetch_page(target_url, active_context)
+            except Exception as first_exc:
+                if not self.config.web_skip_tls_verify and _is_cert_verify_error(first_exc):
+                    tls_warning = "TLS verify failed; search_web auto-retried with verify disabled."
+                    active_context = ssl._create_unverified_context()
+                    return _fetch_page(target_url, active_context)
+                raise
+
+        try:
+            results: list[dict[str, str]] = []
+            source = "unknown"
+            status = 200
+            content_type = "text/html"
+            truncated = False
+            warning_parts: list[str] = []
+            seen_result_keys: set[str] = set()
+
+            def _append_results(items: list[dict[str, str]], source_name: str) -> int:
+                added = 0
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    title = str(item.get("title", "")).strip()
+                    url = str(item.get("url", "")).strip()
+                    if not title and not url:
+                        continue
+                    key = f"{title}|{url}".lower()
+                    if key in seen_result_keys:
+                        continue
+                    seen_result_keys.add(key)
+
+                    row = dict(item)
+                    row.setdefault("source", source_name)
+                    results.append(row)
+                    added += 1
+                    if len(results) >= limit:
+                        break
+                return added
+
+            if prefer_news and rss_allowed_candidates:
+                for rss_name, rss_url in rss_allowed_candidates:
+                    if len(results) >= limit:
+                        break
+                    try:
+                        status, content_type, text, truncated = _fetch_page_with_retry(rss_url)
+                        rss_results = _extract_google_news_rss_results(text, max_results=limit)
+                        if _append_results(rss_results, rss_name) > 0 and source == "unknown":
+                            source = f"rss:{rss_name}"
+                    except Exception as exc:
+                        warning_parts.append(f"{rss_name} 获取失败: {exc}")
+
+            ddg_error: str | None = None
+            if ddg_allowed and not results:
+                try:
+                    status, content_type, text, truncated = _fetch_page_with_retry(search_url)
+                    ddg_results = _extract_ddg_results(text, max_results=limit)
+                    if _append_results(ddg_results, "duckduckgo_html") > 0:
+                        source = "duckduckgo_html"
+                    if not results:
+                        status, content_type, text, truncated = _fetch_page_with_retry(lite_url)
+                        ddg_results = _extract_ddg_results(text, max_results=limit)
+                        if _append_results(ddg_results, "duckduckgo_lite") > 0:
+                            source = "duckduckgo_lite"
+                except Exception as exc:
+                    ddg_error = str(exc)
+
+            if ddg_error:
+                warning_parts.append(f"DuckDuckGo 搜索失败: {ddg_error}")
+
+            if not results and rss_allowed_candidates and not prefer_news:
+                for rss_name, rss_url in rss_allowed_candidates:
+                    if len(results) >= limit:
+                        break
+                    try:
+                        status, content_type, text, truncated = _fetch_page_with_retry(rss_url)
+                        rss_results = _extract_google_news_rss_results(text, max_results=limit)
+                        if _append_results(rss_results, rss_name) > 0 and source == "unknown":
+                            source = f"rss:{rss_name}"
+                    except Exception as exc:
+                        warning_parts.append(f"{rss_name} 回退失败: {exc}")
+
+            if not results and prefer_baseball:
+                curated = [
+                    {
+                        "title": "MLB News (Official)",
+                        "url": "https://www.mlb.com/news",
+                        "snippet": "Fallback source when search engines are blocked.",
+                        "source": "fallback_static",
+                    },
+                    {
+                        "title": "ESPN MLB",
+                        "url": "https://www.espn.com/mlb/",
+                        "snippet": "Fallback source when search engines are blocked.",
+                        "source": "fallback_static",
+                    },
+                    {
+                        "title": "Yahoo Sports MLB",
+                        "url": "https://sports.yahoo.com/mlb/",
+                        "snippet": "Fallback source when search engines are blocked.",
+                        "source": "fallback_static",
+                    },
+                    {
+                        "title": "NPB Official",
+                        "url": "https://npb.jp/",
+                        "snippet": "Fallback source when search engines are blocked.",
+                        "source": "fallback_static",
+                    },
+                    {
+                        "title": "Yahoo Japan NPB",
+                        "url": "https://baseball.yahoo.co.jp/npb/",
+                        "snippet": "Fallback source when search engines are blocked.",
+                        "source": "fallback_static",
+                    },
+                ]
+                for item in curated:
+                    host = (urllib.parse.urlsplit(item["url"]).hostname or "").strip().lower()
+                    if host and self._domain_allowed(host):
+                        results.append(item)
+                    if len(results) >= limit:
+                        break
+                if results:
+                    source = "fallback:baseball_static_links"
+                    warning_parts.append("实时新闻抓取受限，已回退到可访问的棒球新闻入口链接。")
+
+            if not results:
+                warning_parts.append("搜索结果页解析为空，可能被网关改写或反爬。")
+
+            if tls_warning:
+                warning_parts.insert(0, tls_warning)
+
+            warning = " ".join(part.strip() for part in warning_parts if part and part.strip()) or None
+            if source == "unknown":
+                source = "none"
+
+            return {
+                "ok": True,
+                "query": q,
+                "engine": source,
+                "status": status,
+                "content_type": content_type,
+                "count": len(results),
+                "results": results,
+                "truncated": truncated,
+                "warning": warning,
+            }
+        except urllib.error.HTTPError as exc:
+            body = exc.read(4000).decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
+            return {"ok": False, "error": f"HTTP {exc.code}: {exc.reason}", "body_preview": body}
+        except Exception as exc:
+            return {"ok": False, "error": f"search_web failed: {exc}"}
+
+    def fetch_web(self, url: str, max_chars: int = 120000, timeout_sec: int = 12) -> dict[str, Any]:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in {"http", "https"}:
             return {"ok": False, "error": "Only http/https URLs are supported"}
@@ -556,7 +1055,7 @@ class LocalToolExecutor:
             }
 
         timeout_val = max(3, min(30, timeout_sec))
-        limit = max(512, min(120000, max_chars, self.config.web_fetch_max_chars))
+        limit = max(512, min(500000, max_chars, self.config.web_fetch_max_chars))
         ssl_context: ssl.SSLContext | None = None
         if parsed.scheme == "https":
             if self.config.web_skip_tls_verify:
@@ -572,31 +1071,40 @@ class LocalToolExecutor:
             else:
                 ssl_context = ssl.create_default_context()
 
-        req = urllib.request.Request(
-            url=request_url,
-            headers={
-                "User-Agent": "OfficetoolAgent/1.0",
-                "Accept": "text/html,application/json,text/plain,application/xml;q=0.9,*/*;q=0.5",
-            },
-            method="GET",
-        )
+        default_headers = {
+            # Use a browser-like UA to reduce bot-block false positives.
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/json,text/plain,application/xml;q=0.9,*/*;q=0.5",
+            "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
 
         tls_warning: str | None = None
 
-        def _open(current_context: ssl.SSLContext | None):
+        def _open(current_context: ssl.SSLContext | None, target_url: str):
+            req = urllib.request.Request(
+                url=target_url,
+                headers=default_headers,
+                method="GET",
+            )
             opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=current_context))
             return opener.open(req, timeout=timeout_val)
 
         try:
             try:
-                resp_cm = _open(ssl_context)
+                resp_cm = _open(ssl_context, request_url)
             except Exception as first_exc:
                 # Pragmatic fallback for enterprise TLS chains:
                 # if verification fails and user did not explicitly disable it,
                 # retry once with verification off for fetch_web only.
                 if not self.config.web_skip_tls_verify and _is_cert_verify_error(first_exc):
                     tls_warning = "TLS verify failed; fetch_web auto-retried with verify disabled."
-                    resp_cm = _open(ssl._create_unverified_context())
+                    resp_cm = _open(ssl._create_unverified_context(), request_url)
                 else:
                     raise
 
@@ -634,6 +1142,56 @@ class LocalToolExecutor:
                             "请不要据此下结论，建议改用官方 API 或可直读页面。"
                         )
                         warning = f"{script_warning} {warning}" if warning else script_warning
+
+                        # Search-engine anti-bot fallback: try a text-friendly results page.
+                        search_query = _extract_search_query(url)
+                        if search_query and self._domain_allowed("duckduckgo.com"):
+                            fallback_url = (
+                                "https://duckduckgo.com/html/?q="
+                                + urllib.parse.quote_plus(search_query)
+                            )
+                            try:
+                                with _open(ssl_context, fallback_url) as fb_resp:
+                                    fb_status = getattr(fb_resp, "status", None) or 200
+                                    fb_ct = (fb_resp.headers.get("Content-Type") or "").lower()
+                                    fb_raw = fb_resp.read(limit + 1)
+                                    fb_truncated = len(fb_raw) > limit
+                                    fb_raw = fb_raw[:limit]
+                                    fb_text = fb_raw.decode("utf-8", errors="ignore")
+                                    fb_extracted = _extract_html_text(fb_text, max_chars=limit)
+
+                                if fb_extracted.strip() and not _looks_like_script_payload(fb_extracted):
+                                    if tls_warning:
+                                        warning = f"{tls_warning} {warning}" if warning else tls_warning
+                                    fallback_warning = (
+                                        f"{warning} 已自动回退到 DuckDuckGo HTML 结果页（query={search_query}）。"
+                                        if warning
+                                        else f"已自动回退到 DuckDuckGo HTML 结果页（query={search_query}）。"
+                                    )
+                                    return {
+                                        "ok": True,
+                                        "url": url,
+                                        "status": fb_status,
+                                        "content_type": fb_ct,
+                                        "binary": False,
+                                        "truncated": fb_truncated,
+                                        "content": fb_extracted,
+                                        "length": len(fb_extracted),
+                                        "source_format": "search_fallback_duckduckgo_html",
+                                        "warning": fallback_warning,
+                                    }
+                            except Exception as fb_exc:
+                                warning = (
+                                    f"{warning} DuckDuckGo 回退失败: {fb_exc}"
+                                    if warning
+                                    else f"DuckDuckGo 回退失败: {fb_exc}"
+                                )
+
+                        # Avoid passing noisy script payload to the model.
+                        extracted = (
+                            "[抓取到脚本/反爬页面，正文不可用。"
+                            "请改用目标站点公开 API、可直读正文 URL，或非搜索结果页链接。]"
+                        )
                     if tls_warning:
                         warning = f"{tls_warning} {warning}" if warning else tls_warning
                     return {

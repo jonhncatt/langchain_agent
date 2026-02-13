@@ -41,14 +41,20 @@ class SessionStore:
         self.save(session)
         return session
 
+    def load(self, session_id: str) -> dict[str, Any] | None:
+        path = self._path(session_id)
+        if not path.exists():
+            return None
+        with self._lock:
+            return json.loads(path.read_text(encoding="utf-8"))
+
     def load_or_create(self, session_id: str | None) -> dict[str, Any]:
         if not session_id:
             return self.create()
-        path = self._path(session_id)
-        if not path.exists():
+        loaded = self.load(session_id)
+        if not loaded:
             return self.create()
-        with self._lock:
-            return json.loads(path.read_text(encoding="utf-8"))
+        return loaded
 
     def save(self, session: dict[str, Any]) -> None:
         session["updated_at"] = now_iso()
@@ -65,6 +71,67 @@ class SessionStore:
                 "created_at": now_iso(),
             }
         )
+
+    def list_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
+        max_items = max(1, min(500, int(limit)))
+        files = sorted(
+            self.sessions_dir.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+        out: list[dict[str, Any]] = []
+        for path in files:
+            if len(out) >= max_items:
+                break
+            try:
+                with self._lock:
+                    session = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+
+            sid = str(session.get("id") or path.stem)
+            turns = session.get("turns", [])
+            if not isinstance(turns, list):
+                turns = []
+
+            title = "新会话"
+            for turn in turns:
+                if isinstance(turn, dict) and str(turn.get("role") or "") == "user":
+                    text = str(turn.get("text") or "").strip()
+                    if text:
+                        title = text.replace("\n", " ")[:48]
+                    break
+
+            preview = ""
+            if turns:
+                last = turns[-1]
+                if isinstance(last, dict):
+                    preview = str(last.get("text") or "").replace("\n", " ").strip()[:80]
+
+            out.append(
+                {
+                    "session_id": sid,
+                    "title": title,
+                    "preview": preview,
+                    "turn_count": len(turns),
+                    "updated_at": str(session.get("updated_at") or ""),
+                    "created_at": str(session.get("created_at") or ""),
+                }
+            )
+
+        return out
+
+    def delete(self, session_id: str) -> bool:
+        path = self._path(session_id)
+        if not path.exists():
+            return False
+        try:
+            with self._lock:
+                path.unlink(missing_ok=False)
+            return True
+        except Exception:
+            return False
 
 
 class UploadStore:
@@ -99,6 +166,8 @@ class UploadStore:
         kind = "other"
         if mime.startswith("image/") or suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".heif"}:
             kind = "image"
+        elif mime.lower() in {"application/vnd.ms-outlook", "application/x-msg"}:
+            kind = "document"
         elif suffix in {
             ".txt",
             ".md",
@@ -106,6 +175,7 @@ class UploadStore:
             ".json",
             ".pdf",
             ".docx",
+            ".msg",
             ".doc",
             ".xlsx",
             ".xls",
@@ -157,12 +227,13 @@ class UploadStore:
         self._save_index(index)
 
 
-def _empty_totals() -> dict[str, int]:
+def _empty_totals() -> dict[str, int | float]:
     return {
         "requests": 0,
         "input_tokens": 0,
         "output_tokens": 0,
         "total_tokens": 0,
+        "estimated_cost_usd": 0.0,
     }
 
 
@@ -193,11 +264,12 @@ class TokenStatsStore:
     def clear(self) -> None:
         self._write(self._new_state())
 
-    def _normalize_usage(self, usage: dict[str, Any]) -> dict[str, int]:
+    def _normalize_usage(self, usage: dict[str, Any]) -> dict[str, float]:
         return {
             "input_tokens": int(usage.get("input_tokens", 0) or 0),
             "output_tokens": int(usage.get("output_tokens", 0) or 0),
             "total_tokens": int(usage.get("total_tokens", 0) or 0),
+            "estimated_cost_usd": float(usage.get("estimated_cost_usd", 0.0) or 0.0),
         }
 
     def add_usage(self, session_id: str, usage: dict[str, Any], model: str | None = None) -> dict[str, Any]:
@@ -209,6 +281,7 @@ class TokenStatsStore:
         totals["input_tokens"] = int(totals.get("input_tokens", 0) or 0) + norm["input_tokens"]
         totals["output_tokens"] = int(totals.get("output_tokens", 0) or 0) + norm["output_tokens"]
         totals["total_tokens"] = int(totals.get("total_tokens", 0) or 0) + norm["total_tokens"]
+        totals["estimated_cost_usd"] = float(totals.get("estimated_cost_usd", 0.0) or 0.0) + norm["estimated_cost_usd"]
 
         sessions = data.setdefault("sessions", {})
         sess = sessions.setdefault(session_id, _empty_totals())
@@ -216,6 +289,7 @@ class TokenStatsStore:
         sess["input_tokens"] = int(sess.get("input_tokens", 0) or 0) + norm["input_tokens"]
         sess["output_tokens"] = int(sess.get("output_tokens", 0) or 0) + norm["output_tokens"]
         sess["total_tokens"] = int(sess.get("total_tokens", 0) or 0) + norm["total_tokens"]
+        sess["estimated_cost_usd"] = float(sess.get("estimated_cost_usd", 0.0) or 0.0) + norm["estimated_cost_usd"]
 
         records = data.setdefault("records", [])
         records.append(
@@ -227,6 +301,11 @@ class TokenStatsStore:
                 "output_tokens": norm["output_tokens"],
                 "total_tokens": norm["total_tokens"],
                 "llm_calls": int(usage.get("llm_calls", 0) or 0),
+                "estimated_cost_usd": norm["estimated_cost_usd"],
+                "pricing_known": bool(usage.get("pricing_known", False)),
+                "pricing_model": usage.get("pricing_model"),
+                "input_price_per_1m": usage.get("input_price_per_1m"),
+                "output_price_per_1m": usage.get("output_price_per_1m"),
             }
         )
 

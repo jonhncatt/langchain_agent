@@ -14,13 +14,19 @@ from app.models import (
     ChatRequest,
     ChatResponse,
     ClearStatsResponse,
+    DeleteSessionResponse,
     HealthResponse,
     NewSessionResponse,
+    SessionDetailResponse,
+    SessionListItem,
+    SessionListResponse,
+    SessionTurn,
     TokenStatsResponse,
     TokenTotals,
     TokenUsage,
     UploadResponse,
 )
+from app.pricing import estimate_usage_cost
 from app.storage import SessionStore, TokenStatsStore, UploadStore
 
 config = load_config()
@@ -77,6 +83,50 @@ def create_session() -> NewSessionResponse:
     return NewSessionResponse(session_id=session["id"])
 
 
+@app.delete("/api/session/{session_id}", response_model=DeleteSessionResponse)
+def delete_session(session_id: str) -> DeleteSessionResponse:
+    deleted = session_store.delete(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return DeleteSessionResponse(ok=True, session_id=session_id)
+
+
+@app.get("/api/session/{session_id}", response_model=SessionDetailResponse)
+def get_session(session_id: str, max_turns: int = 200) -> SessionDetailResponse:
+    loaded = session_store.load(session_id)
+    if not loaded:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    turns_raw = loaded.get("turns", [])
+    if not isinstance(turns_raw, list):
+        turns_raw = []
+    limited_turns = turns_raw[-max(1, min(2000, max_turns)) :]
+    turns: list[SessionTurn] = []
+    for item in limited_turns:
+        if not isinstance(item, dict):
+            continue
+        turns.append(
+            SessionTurn(
+                role=str(item.get("role") or "user"),
+                text=str(item.get("text") or ""),
+                created_at=str(item.get("created_at")) if item.get("created_at") else None,
+            )
+        )
+
+    return SessionDetailResponse(
+        session_id=session_id,
+        summary=str(loaded.get("summary") or ""),
+        turn_count=len(turns_raw),
+        turns=turns,
+    )
+
+
+@app.get("/api/sessions", response_model=SessionListResponse)
+def list_sessions(limit: int = 50) -> SessionListResponse:
+    rows = session_store.list_sessions(limit=limit)
+    return SessionListResponse(sessions=[SessionListItem(**row) for row in rows])
+
+
 @app.post("/api/upload", response_model=UploadResponse)
 async def upload(file: UploadFile = File(...)) -> UploadResponse:
     if not file.filename:
@@ -129,7 +179,7 @@ def chat(req: ChatRequest) -> ChatResponse:
     found_attachment_ids = {str(item.get("id")) for item in attachments if item.get("id")}
     missing_attachment_ids = [file_id for file_id in req.attachment_ids if file_id not in found_attachment_ids]
 
-    text, tool_events, attachment_note, execution_plan, execution_trace, token_usage = agent.run_chat(
+    text, tool_events, attachment_note, execution_plan, execution_trace, debug_flow, token_usage = agent.run_chat(
         history_turns=session.get("turns", []),
         summary=session.get("summary", ""),
         user_message=req.message,
@@ -139,6 +189,14 @@ def chat(req: ChatRequest) -> ChatResponse:
     if missing_attachment_ids:
         execution_trace.append(
             f"警告: {len(missing_attachment_ids)} 个附件未找到，可能已被清理或会话刷新，请重新上传。"
+        )
+        debug_flow.append(
+            {
+                "step": len(debug_flow) + 1,
+                "stage": "backend_warning",
+                "title": "附件检查",
+                "detail": f"检测到 {len(missing_attachment_ids)} 个附件 ID 丢失，已提示前端重新上传。",
+            }
         )
 
     user_text = req.message.strip()
@@ -154,10 +212,47 @@ def chat(req: ChatRequest) -> ChatResponse:
     session_store.append_turn(session, role="assistant", text=text)
     session_store.save(session)
 
+    selected_model = req.settings.model or config.default_model
+    pricing_meta = estimate_usage_cost(
+        model=selected_model,
+        input_tokens=token_usage.get("input_tokens", 0),
+        output_tokens=token_usage.get("output_tokens", 0),
+    )
+    token_usage = {**token_usage, **pricing_meta}
+    if pricing_meta.get("pricing_known"):
+        execution_trace.append(
+            "费用估算: "
+            f"input ${pricing_meta.get('input_price_per_1m')}/1M, "
+            f"output ${pricing_meta.get('output_price_per_1m')}/1M."
+        )
+        debug_flow.append(
+            {
+                "step": len(debug_flow) + 1,
+                "stage": "backend_pricing",
+                "title": "费用估算",
+                "detail": (
+                    f"按 {pricing_meta.get('pricing_model')} 计价："
+                    f"in ${pricing_meta.get('input_price_per_1m')}/1M, "
+                    f"out ${pricing_meta.get('output_price_per_1m')}/1M, "
+                    f"本轮约 ${pricing_meta.get('estimated_cost_usd')}."
+                ),
+            }
+        )
+    else:
+        execution_trace.append(f"费用估算未启用: 当前模型 {selected_model} 未匹配价格表。")
+        debug_flow.append(
+            {
+                "step": len(debug_flow) + 1,
+                "stage": "backend_pricing",
+                "title": "费用估算",
+                "detail": f"模型 {selected_model} 未匹配内置价格表，仅统计 token。",
+            }
+        )
+
     stats_snapshot = token_stats_store.add_usage(
         session_id=session["id"],
         usage=token_usage,
-        model=req.settings.model or config.default_model,
+        model=selected_model,
     )
     session_totals_raw = stats_snapshot.get("sessions", {}).get(session["id"], {})
     global_totals_raw = stats_snapshot.get("totals", {})
@@ -168,6 +263,7 @@ def chat(req: ChatRequest) -> ChatResponse:
         tool_events=tool_events,
         execution_plan=execution_plan,
         execution_trace=execution_trace,
+        debug_flow=debug_flow,
         missing_attachment_ids=missing_attachment_ids,
         token_usage=TokenUsage(**token_usage),
         session_token_totals=TokenTotals(**session_totals_raw),
